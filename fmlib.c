@@ -1,0 +1,311 @@
+/* fmlib.c - simple V4L2 compatible tuner for radio cards
+
+   Copyright (C) 2009, 2012 Ben Pfaff <blp@cs.stanford.edu>
+
+   This program is free software; you can redistribute it and/or modify it
+   under the terms of the GNU General Public License as published by the Free
+   Software Foundation; either version 2 of the License, or (at your option)
+   any later version.
+
+   This program is distributed in the hope that it will be useful, but WITHOUT
+   ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+   FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+   more details.
+
+   You should have received a copy of the GNU General Public License along with
+   this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#include "fmlib.h"
+#include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+struct tuner_test {
+        int freq;               /* In 1/16 MHz. */
+        int volume;             /* Between 1000 and 2000. */
+        bool mute;              /* Muted? */
+};
+
+char *program_name;
+
+static void query_control(const struct tuner *, uint32_t id,
+                          struct v4l2_queryctrl *);
+static int32_t get_control(const struct tuner *, uint32_t id);
+static int32_t set_control(const struct tuner *, uint32_t id, int32_t value);
+static int32_t query_tuner(const struct tuner *, struct v4l2_tuner *);
+
+void
+fatal(int error, const char *msg, ...)
+{
+        va_list args;
+
+        fprintf(stderr, "%s: ", program_name);
+
+        va_start(args, msg);
+        vfprintf(stderr, msg, args);
+        va_end(args);
+
+        if (error)
+                fprintf(stderr, ": %s", strerror(error));
+        putc('\n', stderr);
+
+        exit(EXIT_FAILURE);
+}
+
+static void *
+xmalloc(size_t n)
+{
+        void *p = malloc(n ? n : 1);
+        if (!p)
+                fatal(0, "out of memory");
+        return p;
+}
+
+int
+tuner_open(struct tuner *tuner, const char *device, int index)
+{
+        memset(tuner, 0, sizeof(struct tuner));
+        if (!device)
+                device = "/dev/radio0";
+        else if (!strcmp(device, "test") || !strncmp(device, "test ", 5)) {
+                double volume;
+                int mute;
+                int n;
+
+                n = sscanf(device, "test %lf %d", &volume, &mute);
+                if (n < 1)
+                        volume = 50;
+                if (n < 2)
+                        mute = 0;
+
+                tuner->test = xmalloc(sizeof *tuner->test);
+                tuner->test->freq = 90 * 16;
+                tuner->test->volume = volume >= 0 ? volume * 10 + 1000.5 : 0;
+                tuner->test->mute = mute != 0;
+
+                device = "/dev/null";
+        }
+
+	tuner->fd = open(device, O_RDONLY);
+	if (tuner->fd < 0)
+		return -1;
+        tuner->index = index;
+
+        query_control(tuner, V4L2_CID_AUDIO_VOLUME, &tuner->volume_ctrl);
+        query_tuner(tuner, &tuner->tuner);
+	return 0;
+}
+
+void
+tuner_close(struct tuner *tuner)
+{
+        close(tuner->fd);
+}
+
+bool
+tuner_is_muted(const struct tuner *tuner)
+{
+        return get_control(tuner, V4L2_CID_AUDIO_MUTE);
+}
+
+void
+tuner_set_mute(struct tuner *tuner, bool mute)
+{
+        set_control(tuner, V4L2_CID_AUDIO_MUTE, mute);
+}
+
+bool
+tuner_has_volume_control(const struct tuner *tuner)
+{
+        const struct v4l2_queryctrl *vqc = &tuner->volume_ctrl;
+        return vqc->maximum > vqc->minimum;
+}
+
+double
+tuner_get_volume(const struct tuner *tuner)
+{
+        if (tuner_has_volume_control(tuner)) {
+                const struct v4l2_queryctrl *vqc = &tuner->volume_ctrl;
+                int volume = get_control(tuner, V4L2_CID_AUDIO_VOLUME);
+                return (100.0
+                        * (volume - vqc->minimum)
+                        / (vqc->maximum - vqc->minimum));
+        } else {
+                return 100.0;
+        }
+}
+
+int
+tuner_set_volume(struct tuner *tuner, double volume)
+{
+        if (tuner_has_volume_control(tuner)) {
+                struct v4l2_queryctrl *vqc = &tuner->volume_ctrl;
+                if(set_control(tuner, V4L2_CID_AUDIO_VOLUME,
+                            (volume / 100.0 * (vqc->maximum - vqc->minimum)
+                             + vqc->minimum)) == -1)
+                        return -1;
+        }
+        return 0;
+}
+
+long long int
+tuner_get_min_freq(const struct tuner *tuner)
+{
+        long long int rangelow = tuner->tuner.rangelow;
+        if (!(tuner->tuner.capability & V4L2_TUNER_CAP_LOW))
+                rangelow *= 1000;
+        return rangelow;
+}
+
+long long int
+tuner_get_max_freq(const struct tuner *tuner)
+{
+        long long int rangehigh = tuner->tuner.rangehigh;
+        if (!(tuner->tuner.capability & V4L2_TUNER_CAP_LOW))
+                rangehigh *= 1000;
+        return rangehigh;
+}
+
+int
+tuner_set_freq(const struct tuner *tuner, long long int freq,
+               bool override_range)
+{
+        long long int adj_freq;
+        struct v4l2_frequency vf;
+
+        adj_freq = freq;
+        if (!(tuner->tuner.capability & V4L2_TUNER_CAP_LOW))
+                adj_freq = (adj_freq + 500) / 1000;
+
+	if ((adj_freq < tuner->tuner.rangelow
+             || adj_freq > tuner->tuner.rangehigh)
+            && !override_range)
+                return -2;
+
+        memset(&vf, 0, sizeof vf);
+        vf.tuner = tuner->index;
+        vf.type = tuner->tuner.type;
+        vf.frequency = adj_freq;
+        if (tuner->test) {
+                tuner->test->freq = adj_freq;
+        }
+        else if (ioctl(tuner->fd, VIDIOC_S_FREQUENCY, &vf) == -1)
+                return -1;
+        return 0;
+}
+
+int
+tuner_get_signal(const struct tuner *tuner)
+{
+        struct v4l2_tuner vt;
+
+        query_tuner(tuner, &vt);
+        return vt.signal;
+}
+
+void
+tuner_usleep(const struct tuner *tuner, int usecs)
+{
+        if (!tuner->test)
+                usleep(usecs);
+}
+
+void
+tuner_sleep(const struct tuner *tuner, int secs)
+{
+        if (!tuner->test)
+                sleep(secs);
+}
+
+/* Queries 'tuner' for a property with the given 'id' and fills in 'qc' with
+ * the result.  If 'tuner' doesn't have such a property, clears 'qc' to
+ * all-zeros. */
+static void
+query_control(const struct tuner *tuner, uint32_t id,
+              struct v4l2_queryctrl *qc)
+{
+        memset(qc, 0, sizeof *qc);
+        qc->id = id;
+        if (tuner->test) {
+                assert(id == V4L2_CID_AUDIO_VOLUME);
+                if (tuner->test->volume) {
+                        qc->minimum = 1000;
+                        qc->maximum = 2000;
+                }
+        } else if (ioctl(tuner->fd, VIDIOC_QUERYCTRL, qc) != -1) {
+                /* Success. */
+        } else if (errno == ENOTTY || errno == EINVAL) {
+                /* This tuner doesn't support either query operation
+                 * or the specific control ('id') respectively */
+                memset(qc, 0, sizeof *qc);
+        } else {
+                fatal(errno, "VIDIOC_QUERYCTRL");
+        }
+}
+
+static int32_t
+get_control(const struct tuner *tuner, uint32_t id)
+{
+        struct v4l2_control control;
+
+        memset(&control, 0, sizeof control);
+        control.id = id;
+        if (tuner->test) {
+                if (id == V4L2_CID_AUDIO_VOLUME)
+                        control.value = tuner->test->volume;
+                else if (id == V4L2_CID_AUDIO_MUTE)
+                        control.value = tuner->test->mute;
+                else
+                        abort();
+        } else if (ioctl(tuner->fd, VIDIOC_G_CTRL, &control) == -1)
+                fatal(errno, "VIDIOC_G_CTRL");
+        return control.value;
+}
+
+static int32_t
+set_control(const struct tuner *tuner, uint32_t id, int32_t value)
+{
+        struct v4l2_control control;
+
+        memset(&control, 0, sizeof control);
+        control.id = id;
+        control.value = value;
+        if (tuner->test) {
+                if (id == V4L2_CID_AUDIO_MUTE) {
+                        assert(value == 0 || value == 1);
+                        tuner->test->mute = value;
+                } else if (id == V4L2_CID_AUDIO_VOLUME) {
+                        assert(value >= 1000 && value <= 2000);
+                        tuner->test->volume = value;
+                } else {
+                        abort();
+                }
+        } else if (ioctl(tuner->fd, VIDIOC_S_CTRL, &control) == -1)
+                return -1;
+        return 0;
+}
+
+static int32_t
+query_tuner(const struct tuner *tuner, struct v4l2_tuner *vt)
+{
+        memset(vt, 0, sizeof *vt);
+        vt->index = tuner->index;
+        if (tuner->test) {
+                int freq = tuner->test->freq;
+                vt->rangelow = 16 * 89;
+                vt->rangehigh = 16 * 91;
+                vt->signal = (freq == (int) (16 * 89.6 + .5) ? 64000
+                              : freq == (int) (16 * 90.4 + .5) ? 50000
+                               : freq == (int) (16 * 90.5 + .5) ? 40000
+                              : 1000);
+        } else if (ioctl(tuner->fd, VIDIOC_G_TUNER, vt) == -1)
+                return -1;
+        return 0;
+}
