@@ -50,7 +50,7 @@ function Tuner(device_number)
 	});
 
 	if(this.fmlib.tuner_open(this.tuner_struct.ref(), '/dev/radio' + device_number, 0) != 0)
-		throw "Radio device ' + device_number + 'not found";
+		throw 'Radio device ' + device_number + 'not found';
 
 	this.currentFreq = 0;
 	this.setFrequency(87.5);
